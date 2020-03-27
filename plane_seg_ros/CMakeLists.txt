@@ -17,6 +17,7 @@ find_package(catkin REQUIRED COMPONENTS
 )
 
 find_package(OpenCV 3.0 QUIET)
+find_package(PCL 1.7.2 REQUIRED) # Test
 
 catkin_package(
   INCLUDE_DIRS
@@ -28,9 +29,15 @@ catkin_package(
 include_directories(
 #  include
   ${catkin_INCLUDE_DIRS}
+  ${PCL_INCLUDE_DIRS} # Test
 )
 
+link_directories(${PCL_LIBRARY_DIRS}) # Test
+add_definitions(${PCL_DEFINITIONS}) # Test
 
 set(APP_NAME plane_seg_ros)
 add_executable(${APP_NAME} src/${APP_NAME}.cpp)
 target_link_libraries(${APP_NAME} boost_system ${catkin_LIBRARIES})
+
+add_executable(plane_seg_ri src/plane_seg_ri.cpp)
+target_link_libraries(plane_seg_ri boost_system ${catkin_LIBRARIES} ${PCL_LIBRARIES})

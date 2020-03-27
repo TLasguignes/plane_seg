@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+
+<launch>
+
+  <arg name="elevationMapTopic" default="/elevation_mapping/elevation_map"/>
+  <arg name="pointCloudTopic"   default="/plane_seg/point_cloud_in"/>
+  <arg name="robotPoseTopic"    default="/state_estimator/pose_in_odom"/>
+  <arg name="run_test_program"  default="false"/>
+
+  <!-- Start the Plane Segmentation node -->
+  <node name="plane_seg" pkg="plane_seg_ros" type="plane_seg_ri" output="screen">
+    <param name="elevationMapTopic" value="$(arg elevationMapTopic)"/>
+    <param name="pointCloudTopic"   value="$(arg pointCloudTopic)"/>
+    <param name="robotPoseTopic"    value="$(arg robotPoseTopic)"/>
+    <param name="run_test_program"  value="$(arg run_test_program)"/>
+  </node>
+
+</launch>

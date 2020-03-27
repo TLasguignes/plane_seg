@@ -8,11 +8,14 @@
 #include <ros/ros.h>
 #include <ros/console.h>
 #include <ros/package.h>
+#include <tf/transform_listener.h>
+#include <tf_conversions/tf_eigen.h>
 
 #include <eigen_conversions/eigen_msg.h>
 #include <pcl_conversions/pcl_conversions.h>
 #include <pcl/io/pcd_io.h>
 #include <pcl/io/ply_io.h>
+#include <pcl/visualization/pcl_visualizer.h>
 
 #include <geometry_msgs/PoseStamped.h>
 #include <geometry_msgs/PoseWithCovarianceStamped.h>
@@ -25,9 +28,43 @@
 
 #include "plane_seg/BlockFitter.hpp"
 
+/**
+ * @brief simply convert a quaternion to euler angles.
+ * 
+ * @param q input quaternion.
+ * @param roll roll output.
+ * @param pitch pitch output.
+ * @param yaw yaw output.
+ */
+void quat_to_euler(const Eigen::Quaterniond &q, double &roll, double &pitch, double &yaw){
+  const double q0 = q.w();
+  const double q1 = q.x();
+  const double q2 = q.y();
+  const double q3 = q.z();
+  roll = atan2(2.0 *(q0 * q1 + q2 * q3), 1.0 - 2.0 *(q1 * q1 + q2 * q2));
+  pitch = asin(2.0 *(q0 * q2 - q3 * q1));
+  yaw = atan2(2.0 *(q0 * q3 + q1 * q2), 1.0 - 2.0 *(q2 * q2 + q3 * q3));
+}
+
 class RobotInterface
 {
 public:
+  typedef pcl::PointXYZ PointT;
+  typedef pcl::PointCloud<PointT> CloudT;
+
+  typedef struct{
+    std::string elevationMapTopic;
+    std::string pointCloudTopic;
+    std::string robotPoseTopic;
+  } ri_config_t;
+  
+  typedef struct{
+    Eigen::Isometry3d pose;
+    std::string frame;
+  } robot_pose_t;
+
+  typedef enum{different, identical, unknown} frames_state_t;
+
   RobotInterface(ros::NodeHandle node_);
 
   ~RobotInterface(){}
@@ -39,24 +76,32 @@ public:
   void processCloud(planeseg::LabeledCloud::Ptr &inCloud, Eigen::Vector3f origin, Eigen::Vector3f lookDir);
   void processFromFile(int test_example);
 
-  void publishHullsAsCloud(std::vector<pcl::PointCloud<pcl::PointXYZ>::Ptr> cloud_ptrs,
-                           int secs, int nsecs);
-
-  void publishHullsAsMarkers(std::vector<pcl::PointCloud<pcl::PointXYZ>::Ptr> cloud_ptrs,
-                             int secs, int nsecs);
-
   void printResultAsJson();
   void publishResult();
+  void publishHullsAsCloud(std::vector<CloudT::Ptr> cloud_ptrs,
+                           int secs, int nsecs);
+  void publishHullsAsMarkers(std::vector<CloudT::Ptr> cloud_ptrs,
+                             int secs, int nsecs);
+
+  Eigen::Isometry3d transformPose(robot_pose_t input, std_msgs::Header from_head);
+
+  void spin();
 
 private:
   ros::NodeHandle node_;
-  std::vector<double> colors_;
-
+  tf::TransformListener tf_listener_;
   ros::Subscriber point_cloud_sub_, grid_map_sub_, pose_sub_;
   ros::Publisher received_cloud_pub_, hull_cloud_pub_, hull_markers_pub_, look_pose_pub_;
 
-  Eigen::Isometry3d last_robot_pose_;
+  std::vector<double> colors_;
+  ri_config_t config_;
+
+  robot_pose_t last_robot_pose_;
   planeseg::BlockFitter::Result result_;
+
+  frames_state_t frames_state_;
+
+  pcl::visualization::PCLVisualizer* viewer_;
 };
 
 /**
@@ -65,23 +110,11 @@ private:
  * @param node_ ros::NodeHandle initialized.
  */
 RobotInterface::RobotInterface(ros::NodeHandle node_): node_(node_){
+  //? WTF are these lines for ?!
   std::string input_body_pose_topic;
   node_.getParam("input_body_pose_topic", input_body_pose_topic);
 
-  grid_map_sub_ = node_.subscribe("/elevation_mapping/elevation_map", 100,
-                                  &RobotInterface::elevationMapCallback, this);
-  point_cloud_sub_ = node_.subscribe("/plane_seg/point_cloud_in", 100,
-                                     &RobotInterface::pointCloudCallback, this);
-  pose_sub_ = node_.subscribe("/state_estimator/pose_in_odom", 100,
-                              &RobotInterface::robotPoseCallBack, this);
-
-  received_cloud_pub_ = node_.advertise<sensor_msgs::PointCloud2>("/plane_seg/received_cloud", 10);
-  hull_cloud_pub_ = node_.advertise<sensor_msgs::PointCloud2>("/plane_seg/hull_cloud", 10);
-  hull_markers_pub_ = node_.advertise<visualization_msgs::Marker>("/plane_seg/hull_markers", 10);
-  look_pose_pub_ = node_.advertise<geometry_msgs::PoseStamped>("/plane_seg/look_pose", 10);
-
-  last_robot_pose_ = Eigen::Isometry3d::Identity();
-
+  // Init color table
   colors_ = {
       51 / 255.0, 160 / 255.0, 44 / 255.0, //0
       166 / 255.0, 206 / 255.0, 227 / 255.0,
@@ -111,6 +144,42 @@ RobotInterface::RobotInterface(ros::NodeHandle node_): node_(node_){
       0.5, 0.5, 1.0,
       0.5, 1.0, 0.5,
       0.5, 0.5, 1.0};
+
+  // Init config
+  config_.elevationMapTopic = "/elevation_mapping/elevation_map";
+  config_.pointCloudTopic = "/plane_seg/point_cloud_in";
+  config_.robotPoseTopic = "/state_estimator/pose_in_odom";
+
+  // Get Params
+  node_.getParam("/plane_seg/elevationMapTopic", config_.elevationMapTopic);
+  node_.getParam("/plane_seg/pointCloudTopic", config_.pointCloudTopic);
+  node_.getParam("/plane_seg/robotPoseTopic", config_.robotPoseTopic);
+
+  // Init Subscribers
+  grid_map_sub_ = node_.subscribe(config_.elevationMapTopic, 100,
+                                  &RobotInterface::elevationMapCallback, this);
+  point_cloud_sub_ = node_.subscribe(config_.pointCloudTopic, 100,
+                                     &RobotInterface::pointCloudCallback, this);
+  pose_sub_ = node_.subscribe(config_.robotPoseTopic, 100,
+                              &RobotInterface::robotPoseCallBack, this);
+
+  // Init Publishers
+  received_cloud_pub_ = node_.advertise<sensor_msgs::PointCloud2>("/plane_seg/received_cloud", 10);
+  hull_cloud_pub_ = node_.advertise<sensor_msgs::PointCloud2>("/plane_seg/hull_cloud", 10);
+  hull_markers_pub_ = node_.advertise<visualization_msgs::Marker>("/plane_seg/hull_markers", 10);
+  look_pose_pub_ = node_.advertise<geometry_msgs::PoseStamped>("/plane_seg/look_pose", 10);
+
+  last_robot_pose_.pose = Eigen::Isometry3d::Identity();
+  last_robot_pose_.frame = "";
+  frames_state_ = unknown;
+
+
+  viewer_ = new pcl::visualization::PCLVisualizer("Cloud Viewer");
+  std::cout<<"viewer created"<<endl;
+  //blocks until the cloud is actually rendered
+  viewer_->addCoordinateSystem(1);
+  viewer_->setBackgroundColor(0.3, 0.3, 0.3);
+  viewer_->setCameraPosition(-25, 0, 10, 0, 0, 0, 0, 0, 1);
 }
 
 /**
@@ -119,26 +188,8 @@ RobotInterface::RobotInterface(ros::NodeHandle node_): node_(node_){
  * @param msg received pose as a PoseWithCovarianceStamped.
  */
 void RobotInterface::robotPoseCallBack(const geometry_msgs::PoseWithCovarianceStampedConstPtr &msg){
-  //std::cout<<"got pose\n";
-  tf::poseMsgToEigen(msg->pose.pose, last_robot_pose_);
-}
-
-/**
- * @brief simply convert a quaternion to euler angles.
- * 
- * @param q input quaternion.
- * @param roll roll output.
- * @param pitch pitch output.
- * @param yaw yaw output.
- */
-void quat_to_euler(const Eigen::Quaterniond &q, double &roll, double &pitch, double &yaw){
-  const double q0 = q.w();
-  const double q1 = q.x();
-  const double q2 = q.y();
-  const double q3 = q.z();
-  roll = atan2(2.0 *(q0 * q1 + q2 * q3), 1.0 - 2.0 *(q1 * q1 + q2 * q2));
-  pitch = asin(2.0 *(q0 * q2 - q3 * q1));
-  yaw = atan2(2.0 *(q0 * q3 + q1 * q2), 1.0 - 2.0 *(q2 * q2 + q3 * q3));
+  tf::poseMsgToEigen(msg->pose.pose, last_robot_pose_.pose);
+  last_robot_pose_.frame = msg->header.frame_id;
 }
 
 /**
@@ -178,10 +229,29 @@ void RobotInterface::elevationMapCallback(const grid_map_msgs::GridMap &msg){
   pcl::fromROSMsg(pointCloud, *inCloud);
 
   Eigen::Vector3f origin, lookDir;
-  origin<<last_robot_pose_.translation().cast<float>();
-  lookDir = convertRobotPoseToSensorLookDir(last_robot_pose_);
+  origin<<last_robot_pose_.pose.translation().cast<float>();
+  lookDir = convertRobotPoseToSensorLookDir(last_robot_pose_.pose);
 
   processCloud(inCloud, origin, lookDir);
+}
+
+Eigen::Isometry3d RobotInterface::transformPose(robot_pose_t input, std_msgs::Header from_head){
+  ros::Time msg_time(from_head.stamp.sec, from_head.stamp.nsec);
+  tf::StampedTransform transform_pose;
+  try {
+    // waitForTransform( to frame, from frame, ... )
+    tf_listener_.waitForTransform(input.frame, from_head.frame_id, msg_time, ros::Duration(1.0));
+    tf_listener_.lookupTransform(input.frame, from_head.frame_id, msg_time, transform_pose);
+  }
+  catch (tf::TransformException ex)
+  {
+    ROS_ERROR("%s : ", ex.what());
+    ROS_ERROR("Skipping point cloud.");
+    return Eigen::Isometry3d::Identity();
+  }
+  Eigen::Isometry3d transform_pose_eigen;
+  tf::transformTFToEigen(transform_pose, transform_pose_eigen);
+  return (transform_pose_eigen * input.pose);
 }
 
 /**
@@ -194,11 +264,38 @@ void RobotInterface::pointCloudCallback(const sensor_msgs::PointCloud2::ConstPtr
   planeseg::LabeledCloud::Ptr inCloud(new planeseg::LabeledCloud());
   pcl::fromROSMsg(*msg, *inCloud);
 
+  Eigen::Isometry3d pose = last_robot_pose_.pose;
+  if(frames_state_ == unknown){
+    if(last_robot_pose_.frame.compare("") == 0){
+      frames_state_ = unknown;
+      pose = Eigen::Isometry3d::Identity();
+    } else if(last_robot_pose_.frame.compare(msg->header.frame_id) == 0){
+      frames_state_ = identical;
+    } else {
+      frames_state_ = different;
+      pose = transformPose(last_robot_pose_, msg->header);
+    }
+  } else if(frames_state_ == different){
+    pose = transformPose(last_robot_pose_, msg->header);
+  }
   Eigen::Vector3f origin, lookDir;
-  origin<<last_robot_pose_.translation().cast<float>();
-  lookDir = convertRobotPoseToSensorLookDir(last_robot_pose_);
+  origin<<pose.translation().cast<float>();
+  lookDir = convertRobotPoseToSensorLookDir(pose);
 
-  processCloud(inCloud, origin, lookDir);
+  viewer_->removeAllPointClouds();
+  viewer_->removeAllShapes();
+  viewer_->addPointCloud(inCloud, "cloud");
+  pcl::PointXYZ ptO;
+  ptO.x = origin(0);
+  ptO.y = origin(1);
+  ptO.z = origin(2);
+  pcl::PointXYZ ptLD;
+  ptLD.x = lookDir(0);
+  ptLD.y = lookDir(1);
+  ptLD.z = lookDir(2);
+  viewer_->addArrow(ptLD, ptO, 1., 0., 0., false, "arrow");
+
+  // processCloud(inCloud, origin, lookDir);
 }
 
 /**
@@ -370,12 +467,12 @@ void RobotInterface::printResultAsJson(){
  */
 void RobotInterface::publishResult(){
   // convert result to a vector of point clouds
-  std::vector<pcl::PointCloud<pcl::PointXYZ>::Ptr> cloud_ptrs;
+  std::vector<CloudT::Ptr> cloud_ptrs;
   for(size_t i = 0; i < result_.mBlocks.size(); ++i){
-    pcl::PointCloud<pcl::PointXYZ> cloud;
+    CloudT cloud;
     const auto &block = result_.mBlocks[i];
     for(size_t j = 0; j < block.mHull.size(); ++j){
-      pcl::PointXYZ pt;
+      PointT pt;
       pt.x = block.mHull[j](0);
       pt.y = block.mHull[j](1);
       pt.z = block.mHull[j](2);
@@ -383,7 +480,7 @@ void RobotInterface::publishResult(){
     }
     cloud.height = cloud.points.size();
     cloud.width = 1;
-    pcl::PointCloud<pcl::PointXYZ>::Ptr cloud_ptr;
+    CloudT::Ptr cloud_ptr;
     cloud_ptr = cloud.makeShared();
     cloud_ptrs.push_back(cloud_ptr);
   }
@@ -392,7 +489,7 @@ void RobotInterface::publishResult(){
   publishHullsAsMarkers(cloud_ptrs, 0, 0);
 
   //pcl::PCDWriter pcd_writer_;
-  //pcd_writer_.write<pcl::PointXYZ>("/home/mfallon/out.pcd", cloud, false);
+  //pcd_writer_.write<PointT>("/home/mfallon/out.pcd", cloud, false);
   //std::cout<<"blocks: "<<result_.mBlocks.size()<<" blocks\n";
   //std::cout<<"cloud: "<<cloud.points.size()<<" pts\n";
 }
@@ -404,7 +501,7 @@ void RobotInterface::publishResult(){
  * @param secs seconds part of the timestamp.
  * @param nsecs nano seconds part of the timestamp.
  */
-void RobotInterface::publishHullsAsCloud(std::vector<pcl::PointCloud<pcl::PointXYZ>::Ptr> cloud_ptrs,
+void RobotInterface::publishHullsAsCloud(std::vector<CloudT::Ptr> cloud_ptrs,
                                          int secs, int nsecs){
   pcl::PointCloud<pcl::PointXYZRGB> combined_cloud;
   for(size_t i = 0; i < cloud_ptrs.size(); ++i){
@@ -438,7 +535,7 @@ void RobotInterface::publishHullsAsCloud(std::vector<pcl::PointCloud<pcl::PointX
  * @param secs seconds part of the timestamp.
  * @param nsecs nano seconds part of the timestamp.
  */
-void RobotInterface::publishHullsAsMarkers(std::vector<pcl::PointCloud<pcl::PointXYZ>::Ptr> cloud_ptrs,
+void RobotInterface::publishHullsAsMarkers(std::vector<CloudT::Ptr> cloud_ptrs,
                                            int secs, int nsecs){
   geometry_msgs::Point point;
   std_msgs::ColorRGBA point_color;
@@ -518,6 +615,13 @@ void RobotInterface::publishHullsAsMarkers(std::vector<pcl::PointCloud<pcl::Poin
   hull_markers_pub_.publish(marker);
 }
 
+void RobotInterface::spin(){
+  while(!ros::isShuttingDown() && !viewer_->wasStopped()){
+    ros::spinOnce();
+    viewer_->spinOnce();
+  }
+}
+
 int main(int argc, char **argv){
   // Turn off warning message about labels
   // TODO: look into how labels are used
@@ -550,7 +654,7 @@ int main(int argc, char **argv){
   }
 
   ROS_INFO_STREAM("Waiting for ROS messages");
-  ros::spin();
+  app->spin();
 
   return 0;
 }
